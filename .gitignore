@@ -9,7 +9,7 @@ dist
 # code coverage
 coverage
 *.lcov
-
+.codex
 # logs
 logs
 _.log
@@ -32,3 +32,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Durable user accounts, Mem0 provenance, migration backups (never commit personal data)
+.data/
+.mem0/

@@ -11,25 +11,43 @@ export const createAgentSseResponse = ({
 }: {
   onStart: (emit: (event: AgentConsoleEvent) => void) => Promise<void>;
   onError?: (error: unknown) => AgentConsoleEvent;
-}) =>
-  new Response(
+}) => {
+  let closed = false;
+
+  return new Response(
     new ReadableStream({
-      async start(controller) {
+      start(controller) {
         const emit = (event: AgentConsoleEvent) => {
-          controller.enqueue(serializeSseEvent(event));
+          if (closed) {
+            return;
+          }
+
+          try {
+            controller.enqueue(serializeSseEvent(event));
+          } catch {
+            closed = true;
+          }
         };
 
         controller.enqueue(encoder.encode(': connected\n\n'));
 
-        try {
-          await onStart(emit);
-        } catch (error) {
-          if (onError) {
-            emit(onError(error));
+        void (async () => {
+          try {
+            await onStart(emit);
+          } catch (error) {
+            if (onError) {
+              emit(onError(error));
+            }
+          } finally {
+            if (!closed) {
+              closed = true;
+              controller.close();
+            }
           }
-        } finally {
-          controller.close();
-        }
+        })();
+      },
+      cancel() {
+        closed = true;
       },
     }),
     {
@@ -41,3 +59,4 @@ export const createAgentSseResponse = ({
       },
     },
   );
+};

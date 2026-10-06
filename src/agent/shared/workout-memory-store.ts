@@ -1,266 +1,168 @@
-import { Database } from 'bun:sqlite';
-import type { RetrievedMemory, WorkoutMemoryInput } from './types';
+import { createHash } from 'node:crypto';
+import { Mem0OssAdapter, MemoryNotFoundError, MemoryUnavailableError, type Mem0Adapter, type StoredMemory } from './mem0-adapter';
+import { workoutMemoryInputSchema, type RetrievedMemory, type WorkoutMemoryInput } from './types';
 
-interface WorkoutSessionRow {
-  id: string;
-  user_id: string;
-  fingerprint: string;
-  session_at: string;
-  session_type: string;
-  duration_minutes: number;
-  exercise_names_json: string;
-  muscle_groups_json: string;
-  intensity: string;
-  goal_tag: string | null;
-  notes: string | null;
-  created_at: string;
-}
-
+export { MemoryNotFoundError, MemoryUnavailableError } from './mem0-adapter';
+export type { StoredMemory } from './mem0-adapter';
+export type RecentWorkoutMemory = Omit<RetrievedMemory, 'score' | 'daysAgo' | 'matchedTerms'>;
 export interface WorkoutMemorySummary {
   readonly totalStoredSessions: number;
   readonly uniqueUsers: number;
   readonly latestSessionAt: string | null;
 }
 
-const DEFAULT_DB_PATH = new URL('../data/workout-memory.sqlite', import.meta.url).pathname;
-
-const normalizeToken = (value: string) => value.toLowerCase().trim();
-
-const tokenize = (value: string) =>
-  normalizeToken(value)
-    .split(/[^a-z0-9\u4e00-\u9fa5]+/i)
-    .filter(Boolean);
-
-const daysBetween = (now: Date, isoDate: string) => {
-  const sessionDate = new Date(isoDate);
-  const diffMs = Math.max(0, now.getTime() - sessionDate.getTime());
-
-  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
-};
-
-const parseRow = (row: WorkoutSessionRow): Omit<RetrievedMemory, 'score' | 'daysAgo' | 'matchedTerms'> => ({
-  id: row.id,
-  completedAt: row.session_at,
-  sessionType: row.session_type as RetrievedMemory['sessionType'],
-  durationMinutes: row.duration_minutes,
-  exerciseNames: JSON.parse(row.exercise_names_json) as string[],
-  muscleGroups: JSON.parse(row.muscle_groups_json) as string[],
-  intensity: row.intensity as RetrievedMemory['intensity'],
-  goalTag: row.goal_tag,
-  notes: row.notes,
-});
-
-const buildFingerprint = (userId: string, input: WorkoutMemoryInput) =>
-  new Bun.CryptoHasher('sha1')
-    .update(
-      JSON.stringify({
-        userId,
-        sourceId: input.sourceId ?? null,
-        completedAt: input.completedAt,
-        sessionType: input.sessionType,
-        durationMinutes: input.durationMinutes,
-        exerciseNames: [...input.exerciseNames].sort(),
-      }),
-    )
-    .digest('hex');
+export const workoutFingerprint = (userId: string, session: WorkoutMemoryInput) => createHash('sha256').update(JSON.stringify({
+  userId, sourceId: session.sourceId ?? null, completedAt: session.completedAt,
+  sessionType: session.sessionType, durationMinutes: session.durationMinutes,
+  exerciseNames: [...session.exerciseNames].sort(),
+})).digest('hex');
 
 export class WorkoutMemoryStore {
-  private readonly db: Database;
-
-  constructor(path = DEFAULT_DB_PATH) {
-    this.db = new Database(path, { create: true });
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS workout_sessions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        fingerprint TEXT NOT NULL UNIQUE,
-        session_at TEXT NOT NULL,
-        session_type TEXT NOT NULL,
-        duration_minutes INTEGER NOT NULL,
-        exercise_names_json TEXT NOT NULL,
-        muscle_groups_json TEXT NOT NULL,
-        intensity TEXT NOT NULL,
-        goal_tag TEXT,
-        notes TEXT,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_workout_sessions_user_time
-        ON workout_sessions (user_id, session_at DESC);
-    `);
+  private readonly writes = new Map<string, Promise<unknown>>();
+  // Health reports locally observed sessions only; this cache never serves reads.
+  private readonly observed = new Map<string, { userId: string; completedAt: string }>();
+  constructor(private readonly adapter: Mem0Adapter = new Mem0OssAdapter()) {
+    if (typeof adapter === 'string') throw new Error('SQLite memory is retired. Inject a Mem0Adapter for tests; use scripts/migrate-workout-memory.ts for legacy databases.');
   }
 
-  storeSessions(userId: string, sessions: WorkoutMemoryInput[]): string[] {
-    const ids: string[] = [];
+  private async serial<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.writes.get(userId) || Promise.resolve();
+    const next = previous.catch(() => {}).then(fn);
+    this.writes.set(userId, next);
+    try { return await next; }
+    finally { if (this.writes.get(userId) === next) this.writes.delete(userId); }
+  }
 
-    for (const session of sessions) {
-      ids.push(this.storeSession(userId, session));
+  private observe(items: StoredMemory[]) {
+    for (const item of items) {
+      if (item.metadata.kind === 'workout_session') {
+        const session = workoutMemoryInputSchema.parse(item.metadata.session);
+        this.observed.set(item.id, { userId: item.userId, completedAt: session.completedAt });
+      }
     }
+  }
 
+  private session(item: StoredMemory): RecentWorkoutMemory {
+    const input = workoutMemoryInputSchema.parse(item.metadata.session);
+    return { id: item.id, completedAt: input.completedAt, sessionType: input.sessionType,
+      durationMinutes: input.durationMinutes, exerciseNames: input.exerciseNames, muscleGroups: input.muscleGroups,
+      intensity: input.intensity, goalTag: input.goalTag ?? null, notes: input.notes ?? null };
+  }
+
+  async storeSession(userId: string, input: WorkoutMemoryInput, provenance: Record<string, unknown> = {}): Promise<string> {
+    const session = workoutMemoryInputSchema.parse(input);
+    const fingerprint = workoutFingerprint(userId, session);
+    return this.serial(userId, async () => {
+      const existing = await this.adapter.list(userId, { scope: 'workout', metadata: { fingerprint }, limit: 1 });
+      if (existing[0]) { this.observe(existing); return existing[0].id; }
+      const text = `Completed workout at ${session.completedAt}: ${session.sessionType}; ${session.durationMinutes} minutes; exercises: ${session.exerciseNames.join(', ')}; muscle groups: ${session.muscleGroups.join(', ')}; intensity: ${session.intensity}; goal: ${session.goalTag || ''}; notes: ${session.notes || ''}`;
+      const items = await this.adapter.add(userId, [{ role: 'user', content: text }], {
+        scope: 'workout', infer: false,
+        metadata: { schemaVersion: 1, kind: 'workout_session', fingerprint, session,
+          source: 'workout_session', sourceId: session.sourceId || fingerprint,
+          sourceInput: structuredClone(session), provenance, recordedAt: new Date().toISOString() },
+      });
+      if (items.length !== 1) throw new MemoryUnavailableError('Mem0 did not confirm exactly one workout memory. Check Qdrant before retrying.');
+      this.observe(items);
+      return items[0]!.id;
+    });
+  }
+
+  async storeSessions(userId: string, sessions: WorkoutMemoryInput[]): Promise<string[]> {
+    const ids: string[] = [];
+    for (const session of sessions) ids.push(await this.storeSession(userId, session));
     return ids;
   }
 
-  storeSession(userId: string, session: WorkoutMemoryInput): string {
-    const fingerprint = buildFingerprint(userId, session);
-    const existing = this.db
-      .query<{ id: string }, [string]>('SELECT id FROM workout_sessions WHERE fingerprint = ?')
-      .get(fingerprint);
-
-    if (existing) {
-      return existing.id;
-    }
-
-    const id = crypto.randomUUID();
-    const createdAt = new Date().toISOString();
-
-    this.db
-      .query(
-        `
-          INSERT INTO workout_sessions (
-            id,
-            user_id,
-            fingerprint,
-            session_at,
-            session_type,
-            duration_minutes,
-            exercise_names_json,
-            muscle_groups_json,
-            intensity,
-            goal_tag,
-            notes,
-            created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-      )
-      .run(
-        id,
-        userId,
-        fingerprint,
-        session.completedAt,
-        session.sessionType,
-        session.durationMinutes,
-        JSON.stringify(session.exerciseNames),
-        JSON.stringify(session.muscleGroups),
-        session.intensity,
-        session.goalTag ?? null,
-        session.notes ?? null,
-        createdAt,
-      );
-
-    return id;
+  async searchRelevant(userId: string, { query, targetMuscles = [], limit = 5 }: {
+    query: string; targetMuscles?: string[]; limit?: number;
+  }): Promise<RetrievedMemory[]> {
+    const items = await this.adapter.search(userId, [query, ...targetMuscles].join(' ').trim() || 'completed training history', { scope: 'workout', limit });
+    this.observe(items);
+    return items.map(item => {
+      const session = this.session(item);
+      return { ...session, score: item.score ?? 0,
+        daysAgo: Math.max(0, Math.floor((Date.now() - Date.parse(session.completedAt)) / 86_400_000)),
+        matchedTerms: [], // Similarity comes from Mem0; no legacy keyword scoring.
+      };
+    });
   }
 
-  searchRelevant(
-    userId: string,
-    {
-      query,
-      targetMuscles = [],
-      limit = 5,
-    }: {
-      query: string;
-      targetMuscles?: string[];
-      limit?: number;
-    },
-  ): RetrievedMemory[] {
-    const rows = this.db
-      .query<WorkoutSessionRow, [string]>(
-        `
-          SELECT *
-          FROM workout_sessions
-          WHERE user_id = ?
-          ORDER BY session_at DESC
-          LIMIT 80
-        `,
-      )
-      .all(userId);
-
-    const now = new Date();
-    const queryTokens = new Set(tokenize([query, ...targetMuscles].join(' ')));
-    const targetSet = new Set(targetMuscles.map(normalizeToken));
-
-    return rows
-      .map((row) => {
-        const parsed = parseRow(row);
-        const documentTokens = new Set(
-          tokenize(
-            [
-              parsed.sessionType,
-              parsed.goalTag ?? '',
-              parsed.notes ?? '',
-              ...parsed.exerciseNames,
-              ...parsed.muscleGroups,
-            ].join(' '),
-          ),
-        );
-        const matchedTerms = [...queryTokens].filter((token) => documentTokens.has(token));
-        const directMuscleMatches = parsed.muscleGroups.filter((muscle) =>
-          targetSet.has(normalizeToken(muscle)),
-        );
-        const daysAgo = daysBetween(now, parsed.completedAt);
-        const recencyScore =
-          daysAgo <= 7 ? 5 : daysAgo <= 30 ? 4 : daysAgo <= 90 ? 3 : daysAgo <= 180 ? 2 : 1;
-        const score = matchedTerms.length * 4 + directMuscleMatches.length * 3 + recencyScore;
-
-        return {
-          ...parsed,
-          score,
-          daysAgo,
-          matchedTerms,
-        };
-      })
-      .filter((item) => item.score > 0)
-      .sort((left, right) => {
-        if (right.score !== left.score) {
-          return right.score - left.score;
-        }
-
-        return right.completedAt.localeCompare(left.completedAt);
-      })
-      .slice(0, limit);
+  private async allSessions(userId: string) {
+    // OSS 3.3.1 getAll has no cursor. Fail visibly rather than silently truncate counts/recent ordering.
+    const items = await this.adapter.list(userId, { scope: 'workout', limit: 10_001 });
+    if (items.length > 10_000) throw new MemoryUnavailableError('More than 10000 workout memories for this user. Upgrade the Mem0 adapter to paginated listing before listing/counting this account.');
+    this.observe(items);
+    return items;
   }
 
-  listRecent(userId: string, limit = 20): Omit<RetrievedMemory, 'score' | 'daysAgo' | 'matchedTerms'>[] {
-    return this.db
-      .query<WorkoutSessionRow, [string, number]>(
-        `
-          SELECT *
-          FROM workout_sessions
-          WHERE user_id = ?
-          ORDER BY session_at DESC
-          LIMIT ?
-        `,
-      )
-      .all(userId, limit)
-      .map(parseRow);
+  async listRecent(userId: string, limit = 20): Promise<RecentWorkoutMemory[]> {
+    return (await this.allSessions(userId)).map(item => this.session(item))
+      .sort((a, b) => b.completedAt.localeCompare(a.completedAt)).slice(0, Math.max(1, Math.min(limit, 100)));
   }
 
-  getUserSessionCount(userId: string): number {
-    const row = this.db
-      .query<{ total: number }, [string]>(
-        'SELECT COUNT(*) AS total FROM workout_sessions WHERE user_id = ?',
-      )
-      .get(userId);
+  async getUserSessionCount(userId: string): Promise<number> { return (await this.allSessions(userId)).length; }
 
-    return row?.total ?? 0;
+  async rememberConversation(userId: string, messages: Array<{ role: 'user' | 'assistant'; content: string }>, context: {
+    sourceId: string; source?: string;
+  }): Promise<StoredMemory[]> {
+    const userMessages = messages.filter(message => message.role === 'user' && message.content.trim()).map(message => ({ ...message }));
+    if (!userMessages.length) return [];
+    if (!context.sourceId.trim()) throw new Error('Conversation memory requires a traceable sourceId.');
+    const fingerprint = createHash('sha256').update(JSON.stringify({ userId, sourceId: context.sourceId, userMessages })).digest('hex');
+    return this.serial(userId, async () => {
+      const existing = await this.adapter.list(userId, { scope: 'conversation', metadata: { fingerprint }, limit: 100 });
+      if (existing.length) return existing;
+      return this.adapter.add(userId, userMessages, { scope: 'conversation', infer: true,
+        metadata: { schemaVersion: 1, kind: 'conversation_fact', source: context.source || 'chat',
+          sourceId: context.sourceId, fingerprint, sourceInput: userMessages, recordedAt: new Date().toISOString() } });
+    });
+  }
+
+  async searchMemories(userId: string, query: string, options: { limit?: number } = {}): Promise<StoredMemory[]> {
+    return this.adapter.search(userId, query.trim() || 'fitness goals preferences history', { scope: 'conversation', limit: options.limit || 8 });
+  }
+
+  async listMemories(userId: string, limit = 20): Promise<StoredMemory[]> {
+    return this.adapter.list(userId, { limit: Math.max(1, Math.min(limit, 100)) });
+  }
+
+  async createMemory(userId: string, text: string): Promise<StoredMemory> {
+    if (!text.trim() || text.length > 10_000) throw new Error('Memory text must contain 1 to 10000 characters.');
+    const items = await this.serial(userId, () => this.adapter.add(userId, [{ role: 'user', content: text }], {
+      scope: 'conversation', infer: false,
+      metadata: { schemaVersion: 1, kind: 'manual_memory', source: 'memory-api', sourceId: crypto.randomUUID(),
+        sourceInput: text, recordedAt: new Date().toISOString() },
+    }));
+    if (items.length !== 1) throw new MemoryUnavailableError('Mem0 did not confirm exactly one manual memory.');
+    return items[0]!;
+  }
+
+  async updateMemory(userId: string, id: string, text: string): Promise<StoredMemory> {
+    if (!text.trim() || text.length > 10_000) throw new Error('Memory text must contain 1 to 10000 characters.');
+    return this.serial(userId, async () => {
+      const current = await this.adapter.get(userId, id);
+      const session = current.metadata.kind === 'workout_session'
+        ? { ...workoutMemoryInputSchema.parse(current.metadata.session), notes: text.slice(0, 1000) } : undefined;
+      const edit = { sourceId: crypto.randomUUID(), sourceInput: text, previousMemory: current.memory, recordedAt: new Date().toISOString() };
+      const updated = await this.adapter.update(userId, id, text, {
+        ...(session ? { session } : {}),
+        lastUserEdit: edit,
+        userEdits: [...(Array.isArray(current.metadata.userEdits) ? current.metadata.userEdits : []), edit],
+      });
+      this.observe([updated]);
+      return updated;
+    });
+  }
+
+  async deleteMemory(userId: string, id: string): Promise<void> {
+    await this.serial(userId, () => this.adapter.delete(userId, id));
+    this.observed.delete(id);
   }
 
   getSummary(): WorkoutMemorySummary {
-    const row = this.db
-      .query<WorkoutMemorySummary, []>(
-        `
-          SELECT
-            COUNT(*) AS totalStoredSessions,
-            COUNT(DISTINCT user_id) AS uniqueUsers,
-            MAX(session_at) AS latestSessionAt
-          FROM workout_sessions
-        `,
-      )
-      .get();
-
-    return {
-      totalStoredSessions: row?.totalStoredSessions ?? 0,
-      uniqueUsers: row?.uniqueUsers ?? 0,
-      latestSessionAt: row?.latestSessionAt ?? null,
-    };
+    const sessions = [...this.observed.values()];
+    return { totalStoredSessions: sessions.length, uniqueUsers: new Set(sessions.map(item => item.userId)).size,
+      latestSessionAt: sessions.map(item => item.completedAt).sort().at(-1) || null };
   }
 }

@@ -69,6 +69,14 @@ export const createTextApi = (runtime: ServerRuntime) =>
           tags: ['text'],
         },
         body: submitTextSchema,
+        transform({ body, status }) {
+          // Check parsed input before Record normalization changes its type.
+          const metadata = body?.metadata;
+          if (metadata !== undefined &&
+            (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata))) {
+            throw status(422, { message: 'metadata must be an object' });
+          }
+        },
         response: {
           401: authErrorSchema,
           201: t.Object({

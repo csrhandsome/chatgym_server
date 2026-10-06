@@ -1,5 +1,5 @@
 import { Elysia, t } from 'elysia';
-import { generateTrainingPlan } from '../agent/planning/workflows/generate-training-plan';
+import { generatePlanningResponse } from '../agent/planning/workflows/generate-training-plan';
 import {
   memoryAppendRequestSchema,
   type PlanImageInput,
@@ -9,6 +9,7 @@ import {
   vlmAnalyzeRequestSchema,
 } from '../agent/shared/types';
 import { analyzeFitnessImages } from '../agent/vlm/workflows/analyze-fitness-images';
+import { MemoryNotFoundError, MemoryUnavailableError } from '../agent/shared/workout-memory-store';
 import { createAuthContext, resolveAuthenticatedUser } from '../plugins/auth';
 import type { ServerRuntime } from '../runtime';
 import { createAgentSseResponse } from './sse';
@@ -23,6 +24,27 @@ const memoryResponseSchema = t.Object({
   storedIds: t.Array(t.String()),
   totalSessionsForUser: t.Number({ minimum: 0 }),
 });
+
+const storedMemorySchema = t.Object({
+  id: t.String(),
+  memory: t.String(),
+  userId: t.String(),
+  metadata: t.Record(t.String(), t.Unknown()),
+  score: t.Optional(t.Number()),
+  createdAt: t.Optional(t.String()),
+  updatedAt: t.Optional(t.String()),
+});
+
+const memoryListResponseSchema = t.Object({ items: t.Array(storedMemorySchema) });
+const memoryIdParamsSchema = t.Object({ id: t.String({ minLength: 1, maxLength: 120 }) });
+const memoryTextBodySchema = t.Object({ memory: t.String({ minLength: 1, maxLength: 10000 }) });
+const memoryLimitSchema = t.Optional(t.String());
+const parseMemoryLimit = (raw?: string) => {
+  if (raw === undefined) return 10;
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const limit = Number(raw);
+  return Number.isSafeInteger(limit) && limit <= 50 ? limit : null;
+};
 
 const isMultipartRequest = (contentType?: string) =>
   contentType?.toLowerCase().includes('multipart/form-data') ?? false;
@@ -41,18 +63,50 @@ const parseJsonRequest = async (request: Request) => {
   }
 };
 
+const parseAgentRequest = async (request: Request, parseMultipart: () => Promise<unknown>) => {
+  try {
+    return isMultipartRequest(request.headers.get('content-type') ?? undefined)
+      ? await parseMultipart()
+      : await parseJsonRequest(request);
+  } catch {
+    return invalidJsonPayload;
+  }
+};
+
 const getFormString = (form: MultipartFormData, key: string) => {
   const value = form.get(key);
+
+  if (value !== null && typeof value !== 'string') {
+    throw new Error(`${key} must be a text field`);
+  }
 
   return typeof value === 'string' ? value : undefined;
 };
 
 const parseJsonField = <T>(raw: string | undefined): T | undefined => {
-  if (!raw) {
+  if (raw === undefined) {
     return undefined;
   }
 
   return JSON.parse(raw) as T;
+};
+
+const parseImagePurposes = (raw: string | undefined) => {
+  const value = parseJsonField<unknown>(raw);
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || item.length > 200)) {
+    throw new Error('image purposes must be an array of strings');
+  }
+  return value as string[];
+};
+
+const parseImageDetails = (raw: string | undefined) => {
+  const value = parseJsonField<unknown>(raw);
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => !['auto', 'low', 'high'].includes(item))) {
+    throw new Error('image details must be an array of auto, low or high');
+  }
+  return value as Array<'auto' | 'low' | 'high'>;
 };
 
 const collectFiles = (form: MultipartFormData, keys: string[]) =>
@@ -96,8 +150,8 @@ const buildImageInputsFromFiles = async ({
 const parseMultipartVlmRequest = async (request: Request, userId: string) => {
   const form = await request.formData();
   const files = collectFiles(form, ['images']);
-  const purposes = parseJsonField<string[]>(getFormString(form, 'purposes'));
-  const details = parseJsonField<Array<'auto' | 'low' | 'high'>>(getFormString(form, 'details'));
+  const purposes = parseImagePurposes(getFormString(form, 'purposes'));
+  const details = parseImageDetails(getFormString(form, 'details'));
 
   return {
     userId,
@@ -114,10 +168,20 @@ const parseMultipartVlmRequest = async (request: Request, userId: string) => {
 const parseMultipartPlanRequest = async (request: Request, userId: string, username: string) => {
   const form = await request.formData();
   const rawPayload = getFormString(form, 'payload') ?? getFormString(form, 'request');
-  const payload = parseJsonField<Partial<PlanRequestInput>>(rawPayload) ?? {};
+  const parsedPayload = parseJsonField<Partial<PlanRequestInput>>(rawPayload);
+  const payload = parsedPayload === undefined ? {} : parsedPayload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('plan payload must be an object');
+  }
+  if (payload.user !== undefined && (payload.user === null || typeof payload.user !== 'object' || Array.isArray(payload.user))) {
+    throw new Error('plan user must be an object');
+  }
+  if (payload.inputImages !== undefined && !Array.isArray(payload.inputImages)) {
+    throw new Error('inputImages must be an array');
+  }
   const files = collectFiles(form, ['inputImages', 'images']);
-  const purposes = parseJsonField<string[]>(getFormString(form, 'inputImagePurposes'));
-  const details = parseJsonField<Array<'auto' | 'low' | 'high'>>(
+  const purposes = parseImagePurposes(getFormString(form, 'inputImagePurposes'));
+  const details = parseImageDetails(
     getFormString(form, 'inputImageDetails'),
   );
   const multipartImages = await buildImageInputsFromFiles({
@@ -169,12 +233,22 @@ const createErrorEvent = ({
   type: 'error' as const,
   timestamp: new Date().toISOString(),
   stage,
-  summary: error instanceof Error ? error.message : `failed during ${stage}`,
+  summary: error instanceof Error ? `${stage} 阶段失败：${error.message}` : `${stage} 阶段执行失败`,
 });
 
 export const createAgentApi = (runtime: ServerRuntime) =>
   new Elysia({ prefix: '/api/agent' })
     .use(createAuthContext(runtime))
+    .onError(({ error, set }) => {
+      if (error instanceof MemoryUnavailableError) {
+        set.status = 503;
+        return { message: error.message };
+      }
+      if (error instanceof MemoryNotFoundError) {
+        set.status = 404;
+        return { message: error.message };
+      }
+    })
     .post(
       '/vlm/analyze',
       async ({ headers, jwt, request, set }) => {
@@ -188,9 +262,8 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           };
         }
 
-        const rawPayload = isMultipartRequest(headers['content-type'])
-          ? await parseMultipartVlmRequest(request, currentUser.id)
-          : await parseJsonRequest(request);
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartVlmRequest(request, currentUser.id));
 
         if (rawPayload === invalidJsonPayload) {
           set.status = 422;
@@ -217,6 +290,9 @@ export const createAgentApi = (runtime: ServerRuntime) =>
             request: normalizeVlmRequest(parsed.data, currentUser),
           });
         } catch (error) {
+          if (error instanceof MemoryUnavailableError || error instanceof MemoryNotFoundError) {
+            throw error;
+          }
           set.status = 500;
 
           return {
@@ -229,11 +305,14 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           summary: 'Analyze fitness-related images for food calories, equipment questions, or planning context',
           tags: ['agent', 'vlm'],
         },
+        // The handler reads Request directly after authentication; do not consume it twice.
+        parse: 'none',
         response: {
           200: t.Any(),
           401: errorResponseSchema,
           422: errorResponseSchema,
           500: errorResponseSchema,
+          503: errorResponseSchema,
         },
       },
     )
@@ -250,9 +329,8 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           };
         }
 
-        const rawPayload = isMultipartRequest(headers['content-type'])
-          ? await parseMultipartVlmRequest(request, currentUser.id)
-          : await parseJsonRequest(request);
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartVlmRequest(request, currentUser.id));
 
         if (rawPayload === invalidJsonPayload) {
           set.status = 422;
@@ -297,6 +375,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           summary: 'Stream visual analysis progress as SSE events',
           tags: ['agent', 'vlm', 'stream'],
         },
+        parse: 'none',
         response: {
           200: t.Any(),
           401: errorResponseSchema,
@@ -317,9 +396,8 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           };
         }
 
-        const rawPayload = isMultipartRequest(headers['content-type'])
-          ? await parseMultipartPlanRequest(request, currentUser.id, currentUser.username)
-          : await parseJsonRequest(request);
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartPlanRequest(request, currentUser.id, currentUser.username));
 
         if (rawPayload === invalidJsonPayload) {
           set.status = 422;
@@ -341,11 +419,14 @@ export const createAgentApi = (runtime: ServerRuntime) =>
         }
 
         try {
-          return await generateTrainingPlan({
+          return await generatePlanningResponse({
             runtime,
             request: normalizePlanRequest(parsed.data, currentUser),
           });
         } catch (error) {
+          if (error instanceof MemoryUnavailableError || error instanceof MemoryNotFoundError) {
+            throw error;
+          }
           set.status = 500;
 
           return {
@@ -359,11 +440,13 @@ export const createAgentApi = (runtime: ServerRuntime) =>
             'Generate a structured workout plan with dedicated planning workflow, lightweight RAG memory, and optional VLM image context',
           tags: ['agent'],
         },
+        parse: 'none',
         response: {
           200: t.Any(),
           401: errorResponseSchema,
           422: errorResponseSchema,
           500: errorResponseSchema,
+          503: errorResponseSchema,
         },
       },
     )
@@ -380,9 +463,8 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           };
         }
 
-        const rawPayload = isMultipartRequest(headers['content-type'])
-          ? await parseMultipartPlanRequest(request, currentUser.id, currentUser.username)
-          : await parseJsonRequest(request);
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartPlanRequest(request, currentUser.id, currentUser.username));
 
         if (rawPayload === invalidJsonPayload) {
           set.status = 422;
@@ -407,7 +489,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
 
         return createAgentSseResponse({
           onStart: async (emit) => {
-            await generateTrainingPlan({
+            await generatePlanningResponse({
               runtime,
               requestId,
               onEvent: emit,
@@ -427,6 +509,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           summary: 'Stream training plan generation progress as SSE events',
           tags: ['agent', 'stream'],
         },
+        parse: 'none',
         response: {
           200: t.Any(),
           401: errorResponseSchema,
@@ -458,7 +541,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           };
         }
 
-        const storedIds = runtime.workoutMemoryStore.storeSessions(
+        const storedIds = await runtime.workoutMemoryStore.storeSessions(
           currentUser.id,
           parsed.data.sessions,
         );
@@ -468,7 +551,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
         return {
           status: 'stored' as const,
           storedIds,
-          totalSessionsForUser: runtime.workoutMemoryStore.getUserSessionCount(currentUser.id),
+          totalSessionsForUser: await runtime.workoutMemoryStore.getUserSessionCount(currentUser.id),
         };
       },
       {
@@ -480,7 +563,120 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           201: memoryResponseSchema,
           401: errorResponseSchema,
           422: errorResponseSchema,
+          503: errorResponseSchema,
         },
+      },
+    )
+    .get(
+      '/memory/search',
+      async ({ headers, jwt, query, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+        if (!currentUser) {
+          set.status = 401;
+          return { message: 'authorization token required' };
+        }
+        const limit = parseMemoryLimit(query.limit);
+        if (limit === null || !query.query.trim()) {
+          set.status = 422;
+          return { message: 'query must not be blank and limit must be an integer from 1 to 50' };
+        }
+        return { items: await runtime.workoutMemoryStore.searchMemories(currentUser.id, query.query.trim(), { limit }) };
+      },
+      {
+        query: t.Object({ query: t.String({ minLength: 1, maxLength: 2000 }), limit: memoryLimitSchema }),
+        response: { 200: memoryListResponseSchema, 401: errorResponseSchema, 422: errorResponseSchema, 503: errorResponseSchema },
+        detail: { summary: 'Search memories belonging to the authenticated user', tags: ['agent', 'memory'] },
+      },
+    )
+    .get(
+      '/memory/items',
+      async ({ headers, jwt, query, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+        if (!currentUser) {
+          set.status = 401;
+          return { message: 'authorization token required' };
+        }
+        const limit = parseMemoryLimit(query.limit);
+        if (limit === null) {
+          set.status = 422;
+          return { message: 'limit must be an integer from 1 to 50' };
+        }
+        return { items: await runtime.workoutMemoryStore.listMemories(currentUser.id, limit) };
+      },
+      {
+        query: t.Object({ limit: memoryLimitSchema }),
+        response: { 200: memoryListResponseSchema, 401: errorResponseSchema, 422: errorResponseSchema, 503: errorResponseSchema },
+        detail: { summary: 'List memories belonging to the authenticated user', tags: ['agent', 'memory'] },
+      },
+    )
+    .patch(
+      '/memory/items/:id',
+      async ({ headers, jwt, params, body, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+        if (!currentUser) {
+          set.status = 401;
+          return { message: 'authorization token required' };
+        }
+        if (!body.memory.trim()) {
+          set.status = 422;
+          return { message: 'memory must not be blank' };
+        }
+        const item = await runtime.workoutMemoryStore.updateMemory(currentUser.id, params.id, body.memory);
+        return { status: 'updated' as const, item };
+      },
+      {
+        params: memoryIdParamsSchema,
+        body: memoryTextBodySchema,
+        response: {
+          200: t.Object({ status: t.Literal('updated'), item: storedMemorySchema }),
+          401: errorResponseSchema, 404: errorResponseSchema, 422: errorResponseSchema, 503: errorResponseSchema,
+        },
+        detail: { summary: 'Update a memory belonging to the authenticated user', tags: ['agent', 'memory'] },
+      },
+    )
+    .delete(
+      '/memory/items/:id',
+      async ({ headers, jwt, params, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+        if (!currentUser) {
+          set.status = 401;
+          return { message: 'authorization token required' };
+        }
+        await runtime.workoutMemoryStore.deleteMemory(currentUser.id, params.id);
+        return { status: 'deleted' as const, id: params.id };
+      },
+      {
+        params: memoryIdParamsSchema,
+        response: {
+          200: t.Object({ status: t.Literal('deleted'), id: t.String() }),
+          401: errorResponseSchema, 404: errorResponseSchema, 503: errorResponseSchema,
+        },
+        detail: { summary: 'Delete a memory belonging to the authenticated user', tags: ['agent', 'memory'] },
+      },
+    )
+    .post(
+      '/memory/items',
+      async ({ headers, jwt, body, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+        if (!currentUser) {
+          set.status = 401;
+          return { message: 'authorization token required' };
+        }
+        if (!body.memory.trim()) {
+          set.status = 422;
+          return { message: 'memory must not be blank' };
+        }
+        const item = await runtime.workoutMemoryStore.createMemory(currentUser.id, body.memory);
+        set.status = 201;
+        return { status: 'stored' as const, item };
+      },
+      {
+        body: memoryTextBodySchema,
+        response: {
+          201: t.Object({ status: t.Literal('stored'), item: storedMemorySchema }),
+          401: errorResponseSchema, 422: errorResponseSchema, 503: errorResponseSchema,
+        },
+        detail: { summary: 'Store an authenticated user memory without rewriting the provided text', tags: ['agent', 'memory'] },
       },
     )
     .get(
@@ -509,8 +705,8 @@ export const createAgentApi = (runtime: ServerRuntime) =>
         const targetUserId = currentUser.id;
 
         return {
-          items: runtime.workoutMemoryStore.listRecent(targetUserId, limit),
-          totalSessionsForUser: runtime.workoutMemoryStore.getUserSessionCount(targetUserId),
+          items: await runtime.workoutMemoryStore.listRecent(targetUserId, limit),
+          totalSessionsForUser: await runtime.workoutMemoryStore.getUserSessionCount(targetUserId),
         };
       },
       {
@@ -531,6 +727,7 @@ export const createAgentApi = (runtime: ServerRuntime) =>
           }),
           401: errorResponseSchema,
           403: errorResponseSchema,
+          503: errorResponseSchema,
         },
       },
     );

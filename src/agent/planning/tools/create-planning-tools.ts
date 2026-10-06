@@ -10,7 +10,25 @@ import {
   trainingGoalSchema,
 } from '../../shared/types';
 
-const getProgrammingConstraints = ({
+type PlanningToolLifecycleHandlers = {
+  onToolCall?: (event: {
+    toolName: string;
+    toolCallId: string;
+    input: Record<string, unknown>;
+  }) => void;
+  onToolResult?: (event: {
+    toolName: string;
+    toolCallId: string;
+    output: unknown;
+  }) => void;
+  onToolError?: (event: {
+    toolName: string;
+    toolCallId: string;
+    error: unknown;
+  }) => void;
+};
+
+export const buildProgrammingConstraints = ({
   goal,
   daysPerWeek,
   sessionDurationMinutes,
@@ -80,7 +98,11 @@ const getProgrammingConstraints = ({
   });
 };
 
-export const createPlanningTools = (memoryStore: WorkoutMemoryStore) => ({
+export const createPlanningTools = (
+  memoryStore: WorkoutMemoryStore,
+  handlers: PlanningToolLifecycleHandlers = {},
+  authenticatedUserId?: string,
+) => ({
   searchWorkoutMemory: tool({
     description:
       'Search the user’s previous workout history using exercise names, muscle groups, notes, and recency.',
@@ -90,11 +112,38 @@ export const createPlanningTools = (memoryStore: WorkoutMemoryStore) => ({
       targetMuscles: z.array(z.string()).max(10).default([]),
       limit: z.number().int().min(1).max(8).default(5),
     }),
-    execute: async ({ userId, query, targetMuscles, limit }) => ({
-      matches: z.array(retrievedMemorySchema).parse(
-        memoryStore.searchRelevant(userId, { query, targetMuscles, limit }),
-      ),
-    }),
+    onInputAvailable: ({ input, toolCallId }) => {
+      handlers.onToolCall?.({
+        toolName: 'searchWorkoutMemory',
+        toolCallId,
+        input,
+      });
+    },
+    execute: async ({ userId, query, targetMuscles, limit }, { toolCallId }) => {
+      try {
+        const output = {
+          matches: z.array(retrievedMemorySchema).parse(
+            await memoryStore.searchRelevant(authenticatedUserId ?? userId, { query, targetMuscles, limit }),
+          ),
+        };
+
+        handlers.onToolResult?.({
+          toolName: 'searchWorkoutMemory',
+          toolCallId,
+          output,
+        });
+
+        return output;
+      } catch (error) {
+        handlers.onToolError?.({
+          toolName: 'searchWorkoutMemory',
+          toolCallId,
+          error,
+        });
+
+        throw error;
+      }
+    },
   }),
   recommendExercises: tool({
     description:
@@ -107,23 +156,53 @@ export const createPlanningTools = (memoryStore: WorkoutMemoryStore) => ({
       trainingExperience: trainingExperienceSchema,
       limit: z.number().int().min(1).max(10).default(6),
     }),
-    execute: async ({
-      focus,
-      targetMuscles,
-      availableEquipment,
-      avoidExercises,
-      trainingExperience,
-      limit,
-    }) => ({
-      recommendations: recommendExercisesFromCatalog({
+    onInputAvailable: ({ input, toolCallId }) => {
+      handlers.onToolCall?.({
+        toolName: 'recommendExercises',
+        toolCallId,
+        input,
+      });
+    },
+    execute: async (
+      {
         focus,
         targetMuscles,
         availableEquipment,
         avoidExercises,
         trainingExperience,
         limit,
-      }),
-    }),
+      },
+      { toolCallId },
+    ) => {
+      try {
+        const output = {
+          recommendations: recommendExercisesFromCatalog({
+            focus,
+            targetMuscles,
+            availableEquipment,
+            avoidExercises,
+            trainingExperience,
+            limit,
+          }),
+        };
+
+        handlers.onToolResult?.({
+          toolName: 'recommendExercises',
+          toolCallId,
+          output,
+        });
+
+        return output;
+      } catch (error) {
+        handlers.onToolError?.({
+          toolName: 'recommendExercises',
+          toolCallId,
+          error,
+        });
+
+        throw error;
+      }
+    },
   }),
   getProgrammingConstraints: tool({
     description:
@@ -137,16 +216,15 @@ export const createPlanningTools = (memoryStore: WorkoutMemoryStore) => ({
       limitations: z.array(z.string()).max(10).default([]),
       soreness: z.array(z.string()).max(10).default([]),
     }),
-    execute: async ({
-      goal,
-      daysPerWeek,
-      sessionDurationMinutes,
-      trainingExperience,
-      injuries,
-      limitations,
-      soreness,
-    }) =>
-      getProgrammingConstraints({
+    onInputAvailable: ({ input, toolCallId }) => {
+      handlers.onToolCall?.({
+        toolName: 'getProgrammingConstraints',
+        toolCallId,
+        input,
+      });
+    },
+    execute: async (
+      {
         goal,
         daysPerWeek,
         sessionDurationMinutes,
@@ -154,7 +232,37 @@ export const createPlanningTools = (memoryStore: WorkoutMemoryStore) => ({
         injuries,
         limitations,
         soreness,
-      }),
+      },
+      { toolCallId },
+    ) => {
+      try {
+        const output = buildProgrammingConstraints({
+          goal,
+          daysPerWeek,
+          sessionDurationMinutes,
+          trainingExperience,
+          injuries,
+          limitations,
+          soreness,
+        });
+
+        handlers.onToolResult?.({
+          toolName: 'getProgrammingConstraints',
+          toolCallId,
+          output,
+        });
+
+        return output;
+      } catch (error) {
+        handlers.onToolError?.({
+          toolName: 'getProgrammingConstraints',
+          toolCallId,
+          error,
+        });
+
+        throw error;
+      }
+    },
   }),
 });
 

@@ -4,6 +4,11 @@ import { resolveMuscleGroup, resolveSupportedExerciseName } from '../../shared/t
 const LOW = 'low' as const;
 const MEDIUM = 'medium' as const;
 const HIGH = 'high' as const;
+const experienceLabelMap: Record<PlanRequestInput['user']['trainingExperience'], string> = {
+  beginner: '新手',
+  intermediate: '中级',
+  advanced: '高级',
+};
 
 const normalize = (value: string) => value.toLowerCase().trim();
 
@@ -56,7 +61,7 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: MEDIUM,
       code: 'weekly-frequency-mismatch',
-      message: 'weeklyFrequency should match the actual number of planned sessions.',
+      message: 'weeklyFrequency 应与实际安排的训练次数一致。',
     });
     score -= 8;
   }
@@ -65,7 +70,7 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: HIGH,
       code: 'too-many-training-days',
-      message: 'The plan uses more training days than the user says are available.',
+      message: '计划安排的训练天数超过了用户可用天数。',
     });
     score -= 20;
   }
@@ -74,7 +79,7 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: MEDIUM,
       code: 'weak-progression',
-      message: 'The plan needs clearer progression rules for future sessions.',
+      message: '计划需要更清晰的渐进规则。',
     });
     score -= 8;
   }
@@ -83,17 +88,22 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: MEDIUM,
       code: 'weak-recovery-guidance',
-      message: 'The plan should give more explicit recovery guidance.',
+      message: '计划需要更明确的恢复建议。',
     });
     score -= 6;
   }
 
   for (const session of plan.weeklySchedule) {
+    const sessionExerciseCount = session.mainBlocks.reduce(
+      (count, block) => count + block.exercises.length,
+      0,
+    );
+
     if (session.durationMinutes > request.schedule.sessionDurationMinutes + 15) {
       issues.push({
         severity: MEDIUM,
         code: `session-too-long-${session.dayIndex}`,
-        message: `${session.dayLabel} runs longer than the user’s available session length.`,
+        message: `${session.dayLabel} 的训练时长超过了用户可接受的单次时长。`,
       });
       score -= 6;
     }
@@ -102,9 +112,19 @@ export const reviewTrainingPlan = ({
       issues.push({
         severity: HIGH,
         code: `missing-prep-${session.dayIndex}`,
-        message: `${session.dayLabel} is missing a warmup or cooldown.`,
+        message: `${session.dayLabel} 缺少热身或冷身。`,
       });
       score -= 10;
+    }
+
+    if (session.mainBlocks.length > 3 || sessionExerciseCount > 5) {
+      issues.push({
+        severity: MEDIUM,
+        code: `session-too-busy-${session.dayIndex}`,
+        message: `${session.dayLabel} 单次训练的动作或区块过多。`,
+      });
+      score -= 6;
+      recommendations.push(`建议将 ${session.dayLabel} 控制在 2-3 个训练区块、且主动作不超过 5 个。`);
     }
   }
 
@@ -133,7 +153,7 @@ export const reviewTrainingPlan = ({
       issues.push({
         severity: MEDIUM,
         code: `recovery-overlap-${current.dayIndex}`,
-        message: `${previous.dayLabel} and ${current.dayLabel} overload similar muscles without enough recovery.`,
+        message: `${previous.dayLabel} 与 ${current.dayLabel} 连续刺激相似肌群，恢复可能不足。`,
       });
       score -= 7;
     }
@@ -147,21 +167,26 @@ export const reviewTrainingPlan = ({
       issues.push({
         severity: MEDIUM,
         code: `volume-high-${muscle}`,
-        message: `${muscle} volume looks high for ${request.user.trainingExperience} level.`,
+        message: `${muscle} 的训练量对${experienceLabelMap[request.user.trainingExperience]}用户来说偏高。`,
       });
       score -= 5;
     }
   }
 
   for (const target of request.goal.targetAreas) {
-    const canonicalTarget = resolveMuscleGroup(target) ?? target;
+    const canonicalTarget = resolveMuscleGroup(target);
+
+    if (!canonicalTarget) {
+      continue;
+    }
+
     const sets = muscleVolumes.get(canonicalTarget) ?? 0;
 
     if (sets < 4) {
       issues.push({
         severity: LOW,
         code: `target-area-light-${normalize(canonicalTarget)}`,
-        message: `The requested target area "${target}" is not emphasized much in the final plan.`,
+        message: `计划对目标部位“${target}”的强调不足。`,
       });
       score -= 3;
     }
@@ -183,10 +208,10 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: MEDIUM,
       code: 'knee-sensitive-exercise-selection',
-      message: 'Knee-sensitive exercises appear in the plan and need a pain-free fallback or reduced depth.',
+      message: '计划中包含对膝盖敏感用户不够友好的动作，需要无痛替代或缩小动作幅度。',
     });
     score -= 6;
-    recommendations.push('Use a pain-free squat depth and lower stair-climber intensity when knees are sensitive.');
+    recommendations.push('膝盖不适时，深蹲应保持无痛幅度，并降低爬楼机强度。');
   }
 
   if (
@@ -196,10 +221,10 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: MEDIUM,
       code: 'back-sensitive-hinge-selection',
-      message: 'A back-demanding barbell or unsupported rowing movement is included despite back sensitivity.',
+      message: '在背部敏感情况下，计划中仍包含高腰背负荷或无支撑划船动作。',
     });
     score -= 6;
-    recommendations.push('Prefer 坐姿划船 or lighter 高位下拉 and reduce barbell loading when the lower back is sensitive.');
+    recommendations.push('下背敏感时，优先选择坐姿划船或较轻的高位下拉，并降低杠铃负重。');
   }
 
   if (
@@ -209,17 +234,17 @@ export const reviewTrainingPlan = ({
     issues.push({
       severity: LOW,
       code: 'shoulder-sensitive-pressing',
-      message: 'Pressing volume should stay in pain-free ranges because the user reports shoulder sensitivity.',
+      message: '用户肩部敏感，推类动作训练量应控制在无痛范围内。',
     });
     score -= 4;
   }
 
   if (issues.length === 0) {
-    recommendations.push('Keep the structure stable for at least one week before making large changes.');
+    recommendations.push('建议至少稳定执行一周后，再做较大的结构调整。');
   }
 
-  recommendations.push('Use readiness markers like sleep, soreness, and energy to auto-regulate the next session.');
-  recommendations.push('If technique degrades early, reduce load before reducing training frequency.');
+  recommendations.push('用睡眠、酸痛和精力等准备度指标来动态调节下一次训练。');
+  recommendations.push('如果动作质量过早下降，先降重量，再考虑减少训练频率。');
 
   const boundedScore = Math.max(0, Math.min(100, score));
 

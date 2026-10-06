@@ -6,8 +6,30 @@ import { createTextApi } from './api/text';
 import { createRuntime, type ServerRuntime } from './runtime';
 import { createTextWs } from './ws/text';
 
+const DEFAULT_CORS_ALLOW_HEADERS = 'authorization, content-type';
+const CORS_HEADERS = {
+  'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+  'access-control-allow-origin': '*',
+  'access-control-max-age': '86400',
+} as const;
+
 export const createApp = (runtime: ServerRuntime = createRuntime()) =>
   new Elysia()
+    .onRequest(({ request, set }) => {
+      set.headers['access-control-allow-methods'] =
+        CORS_HEADERS['access-control-allow-methods'];
+      set.headers['access-control-allow-origin'] =
+        CORS_HEADERS['access-control-allow-origin'];
+      set.headers['access-control-max-age'] = CORS_HEADERS['access-control-max-age'];
+      set.headers['access-control-allow-headers'] =
+        request.headers.get('access-control-request-headers') ??
+        DEFAULT_CORS_ALLOW_HEADERS;
+
+      if (request.method === 'OPTIONS') {
+        set.status = 204;
+        return '';
+      }
+    })
     .get(
       '/',
       () => ({

@@ -48,6 +48,11 @@ export const workoutMemoryInputSchema = z.object({
   notes: z.string().max(1000).optional(),
 });
 
+export const planningChatHistoryItemSchema = z.object({
+  role: z.enum(['user', 'assistant']),
+  text: z.string().max(2000),
+});
+
 export const planRequestSchema = z.object({
   user: z.object({
     id: z.string().min(1).max(120),
@@ -66,6 +71,8 @@ export const planRequestSchema = z.object({
     targetAreas: z.array(z.string().min(1).max(80)).max(10).default([]),
     requestNote: z.string().max(2000).optional(),
   }),
+  // Prompt context only. Durable memory extraction uses goal.requestNote alone.
+  chatHistory: z.array(planningChatHistoryItemSchema).max(14).default([]),
   schedule: z.object({
     availableDaysPerWeek: z.number().int().min(1).max(7),
     sessionDurationMinutes: z.number().int().min(20).max(180),
@@ -101,6 +108,11 @@ export const planRequestSchema = z.object({
   inputImages: z.array(planImageInputSchema).max(6).default([]),
   visionPrompt: z.string().max(2000).optional(),
   rememberedWorkouts: z.array(workoutMemoryInputSchema).max(100).default([]),
+  interactionMode: z.string().min(1).max(40).optional(),
+  responseMode: z.string().min(1).max(40).optional(),
+  mode: z.string().min(1).max(40).optional(),
+  toolStrategy: z.string().min(1).max(40).optional(),
+  conversationMode: z.boolean().optional(),
 });
 
 export const exerciseRecommendationSchema = z.object({
@@ -139,7 +151,7 @@ export const retrievedMemorySchema = z.object({
 export const trainingExerciseSchema = z.object({
   name: supportedExerciseNameSchema,
   sets: z.number().int().min(1).max(8),
-  reps: z.string().min(1).max(80),
+  reps: z.number().int().min(1).max(100),
   restSeconds: z.number().int().min(15).max(600),
   intensity: z.string().min(1).max(80),
   tempo: z.string().min(1).max(40).optional(),
@@ -210,6 +222,7 @@ export const agentEventSchema = z.object({
   stage: z.string().min(1).max(80).optional(),
   stepNumber: z.number().int().min(0).optional(),
   toolName: z.string().min(1).max(120).optional(),
+  toolCallId: z.string().min(1).max(200).optional(),
   summary: z.string().min(1).max(3000),
   text: z.string().min(1).max(12000).optional(),
   input: z.record(z.string(), z.unknown()).optional(),
@@ -219,11 +232,13 @@ export const agentEventSchema = z.object({
 
 export const agentToolTraceSchema = z.object({
   name: z.string(),
+  toolCallId: z.string().min(1).max(200).optional(),
   input: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const agentToolResultTraceSchema = z.object({
   name: z.string(),
+  toolCallId: z.string().min(1).max(200).optional(),
   success: z.boolean(),
   summary: z.string(),
 });
@@ -278,6 +293,10 @@ export const planApiResponseSchema = z.object({
     .optional(),
   review: planReviewSchema,
 });
+
+export const planningDialogResponseSchema = planApiResponseSchema
+  .omit({ plan: true, review: true })
+  .extend({ mode: z.literal('dialog'), answer: z.string().min(1) });
 
 export const vlmTaskSchema = z.enum([
   'food_calorie_estimate',
@@ -357,7 +376,11 @@ export const vlmAnalyzeResponseSchema = z.object({
 
 export type WorkoutMemoryInput = z.infer<typeof workoutMemoryInputSchema>;
 export type PlanImageInput = z.infer<typeof planImageInputSchema>;
-export type PlanRequestInput = z.infer<typeof planRequestSchema>;
+export type PlanningChatHistoryItem = z.infer<typeof planningChatHistoryItemSchema>;
+// Callers may still construct a legacy request; API parsing supplies the [] default.
+export type PlanRequestInput = Omit<z.infer<typeof planRequestSchema>, 'chatHistory'> & {
+  chatHistory?: PlanningChatHistoryItem[];
+};
 export type ExerciseRecommendation = z.infer<typeof exerciseRecommendationSchema>;
 export type ProgrammingConstraint = z.infer<typeof programmingConstraintSchema>;
 export type RetrievedMemory = z.infer<typeof retrievedMemorySchema>;
@@ -369,6 +392,7 @@ export type AgentStepTrace = z.infer<typeof agentStepTraceSchema>;
 export type PlanReview = z.infer<typeof planReviewSchema>;
 export type MemoryAppendRequest = z.infer<typeof memoryAppendRequestSchema>;
 export type PlanApiResponse = z.infer<typeof planApiResponseSchema>;
+export type PlanningDialogResponse = z.infer<typeof planningDialogResponseSchema>;
 export type VlmTask = z.infer<typeof vlmTaskSchema>;
 export type VlmAnalyzeRequest = z.infer<typeof vlmAnalyzeRequestSchema>;
 export type VlmAnalyzeResponse = z.infer<typeof vlmAnalyzeResponseSchema>;

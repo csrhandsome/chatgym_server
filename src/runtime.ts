@@ -1,4 +1,5 @@
 import { WorkoutMemoryStore } from './agent/shared/workout-memory-store';
+import { resolve } from 'node:path';
 import { TextStore } from './services/text-store';
 import { TextStreamHub } from './services/text-stream-hub';
 import { UserStore } from './services/user-store';
@@ -12,13 +13,13 @@ export interface ServerRuntime {
   readonly workoutMemoryStore: WorkoutMemoryStore;
 }
 
-export const createRuntime = (): ServerRuntime => ({
-  serviceName: 'chatgym_server',
-  startedAt: new Date(),
-  textStore: new TextStore(),
-  textStreamHub: new TextStreamHub(),
-  userStore: new UserStore(),
-  workoutMemoryStore: new WorkoutMemoryStore(),
+export const createRuntime = (overrides: Partial<ServerRuntime> = {}): ServerRuntime => ({
+  serviceName: overrides.serviceName ?? 'chatgym_server',
+  startedAt: overrides.startedAt ?? new Date(),
+  textStore: overrides.textStore ?? new TextStore(),
+  textStreamHub: overrides.textStreamHub ?? new TextStreamHub(),
+  userStore: overrides.userStore ?? new UserStore(Bun.env.AUTH_DB_PATH || resolve('.data/users.sqlite')),
+  workoutMemoryStore: overrides.workoutMemoryStore ?? new WorkoutMemoryStore(),
 });
 
 export const buildRuntimeSnapshot = (runtime: ServerRuntime) => ({

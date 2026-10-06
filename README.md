@@ -1,5 +1,8 @@
 # chatgym_server
 
+Requires Bun 1.4.2 or newer. The tested version is recorded in `.bun-version`.
+To update a local Bun installation, run `bun upgrade`.
+
 To install dependencies:
 
 ```bash
@@ -22,6 +25,14 @@ To type-check:
 
 ```bash
 bun run typecheck
+```
+
+Tests and performance diagnostics live in [`src/agent/shared/tests/`](src/agent/shared/tests/README.md).
+`bun run test` also runs the API integration tests in `tests/api/`.
+
+```bash
+bun run test
+bun run test:perf
 ```
 
 ## API
@@ -102,6 +113,10 @@ Recommended endpoints:
 - `POST /api/agent/plan/stream`
 
 The frontend should call them with `fetch()` and read the response body as an SSE stream.
+
+For planning requests resolved to dialog mode (for example, `mode: "dialog"`),
+the JSON response contains `mode: "dialog"` and `answer` instead of `plan` and `review`.
+The final SSE event includes the same `mode` and `answer` fields in its `output`.
 
 ## Multipart Image Upload
 

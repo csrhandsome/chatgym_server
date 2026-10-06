@@ -8,6 +8,7 @@ interface AgentEventInput {
   stage?: string;
   stepNumber?: number;
   toolName?: string;
+  toolCallId?: string;
   text?: string;
   input?: Record<string, unknown>;
   output?: unknown;
@@ -15,6 +16,16 @@ interface AgentEventInput {
 }
 
 type EventListener = (event: AgentConsoleEvent) => void;
+
+const toolDisplayNames: Record<string, string> = {
+  searchWorkoutMemory: '训练记忆检索',
+  recommendExercises: '动作推荐',
+  getProgrammingConstraints: '训练约束查询',
+  estimateFoodCalories: '食物热量估算',
+  lookupFitnessEquipment: '器械识别',
+};
+
+const getToolDisplayName = (toolName: string) => toolDisplayNames[toolName] ?? toolName;
 
 const buildPrimaryStepType = (events: AgentConsoleEvent[]): AgentEventType => {
   if (events.some((event) => event.type === 'tool_call')) {
@@ -82,6 +93,83 @@ export const recordWorkflowThinking = (
     output,
   });
 
+export const recordToolCall = (
+  emit: (input: AgentEventInput) => AgentConsoleEvent,
+  {
+    stepNumber,
+    toolName,
+    toolCallId,
+    input,
+    finishReason,
+  }: {
+    stepNumber?: number;
+    toolName: string;
+    toolCallId?: string;
+    input?: Record<string, unknown>;
+    finishReason?: string;
+  },
+) =>
+  emit({
+    type: 'tool_call',
+    stepNumber,
+    toolName,
+    toolCallId,
+    summary: `正在调用工具：${getToolDisplayName(toolName)}。`,
+    input,
+    finishReason,
+  });
+
+export const recordToolResult = (
+  emit: (input: AgentEventInput) => AgentConsoleEvent,
+  {
+    stepNumber,
+    toolName,
+    toolCallId,
+    output,
+    finishReason,
+  }: {
+    stepNumber?: number;
+    toolName: string;
+    toolCallId?: string;
+    output: unknown;
+    finishReason?: string;
+  },
+) =>
+  emit({
+    type: 'tool_result',
+    stepNumber,
+    toolName,
+    toolCallId,
+    summary: `已收到工具结果：${getToolDisplayName(toolName)}。`,
+    output,
+    finishReason,
+  });
+
+export const recordToolError = (
+  emit: (input: AgentEventInput) => AgentConsoleEvent,
+  {
+    stepNumber,
+    toolName,
+    toolCallId,
+    error,
+  }: {
+    stepNumber?: number;
+    toolName: string;
+    toolCallId?: string;
+    error: unknown;
+  },
+) =>
+  emit({
+    type: 'error',
+    stepNumber,
+    toolName,
+    toolCallId,
+    summary:
+      error instanceof Error
+        ? `工具执行失败：${getToolDisplayName(toolName)}，${error.message}`
+        : `工具执行失败：${getToolDisplayName(toolName)}。`,
+  });
+
 export const recordAgentStep = (
   emit: (input: AgentEventInput) => AgentConsoleEvent,
   step: {
@@ -89,19 +177,26 @@ export const recordAgentStep = (
     finishReason: string;
     text?: string;
     toolCalls: Array<{
+      toolCallId?: string;
       toolName: string;
       dynamic?: boolean;
       input?: unknown;
     }>;
     toolResults: Array<{
+      toolCallId?: string;
       toolName: string;
       output: unknown;
     }>;
   },
+  options?: {
+    emitToolEvents?: boolean;
+    preRecordedEvents?: AgentConsoleEvent[];
+  },
 ): AgentStepTrace => {
-  const stepEvents: AgentConsoleEvent[] = [];
+  const stepEvents: AgentConsoleEvent[] = [...(options?.preRecordedEvents ?? [])];
   const toolCalls = step.toolCalls.map((toolCall) => ({
     name: toolCall.toolName,
+    toolCallId: toolCall.toolCallId,
     input:
       toolCall.dynamic === true || typeof toolCall.input !== 'object' || toolCall.input === null
         ? undefined
@@ -109,6 +204,7 @@ export const recordAgentStep = (
   }));
   const toolResults = step.toolResults.map((toolResult) => ({
     name: toolResult.toolName,
+    toolCallId: toolResult.toolCallId,
     success: true,
     summary: summarizeToolPayload(toolResult.output),
   }));
@@ -118,37 +214,37 @@ export const recordAgentStep = (
       emit({
         type: 'thinking',
         stepNumber: step.stepNumber,
-        summary: 'Model is reasoning about the next action.',
+        summary: '模型正在推理下一步操作。',
         text: step.text,
         finishReason: step.finishReason,
       }),
     );
   }
 
-  for (const toolCall of toolCalls) {
-    stepEvents.push(
-      emit({
-        type: 'tool_call',
-        stepNumber: step.stepNumber,
-        toolName: toolCall.name,
-        summary: `Calling tool ${toolCall.name}.`,
-        input: toolCall.input,
-        finishReason: step.finishReason,
-      }),
-    );
-  }
+  if (options?.emitToolEvents !== false) {
+    for (const toolCall of toolCalls) {
+      stepEvents.push(
+        recordToolCall(emit, {
+          stepNumber: step.stepNumber,
+          toolName: toolCall.name,
+          toolCallId: toolCall.toolCallId,
+          input: toolCall.input,
+          finishReason: step.finishReason,
+        }),
+      );
+    }
 
-  for (const toolResult of step.toolResults) {
-    stepEvents.push(
-      emit({
-        type: 'tool_result',
-        stepNumber: step.stepNumber,
-        toolName: toolResult.toolName,
-        summary: `Received result from ${toolResult.toolName}.`,
-        output: toolResult.output,
-        finishReason: step.finishReason,
-      }),
-    );
+    for (const toolResult of step.toolResults) {
+      stepEvents.push(
+        recordToolResult(emit, {
+          stepNumber: step.stepNumber,
+          toolName: toolResult.toolName,
+          toolCallId: toolResult.toolCallId,
+          output: toolResult.output,
+          finishReason: step.finishReason,
+        }),
+      );
+    }
   }
 
   if (step.text) {
@@ -156,7 +252,7 @@ export const recordAgentStep = (
       emit({
         type: 'text',
         stepNumber: step.stepNumber,
-        summary: 'Model produced text output.',
+        summary: '模型已产出文本内容。',
         text: step.text,
         finishReason: step.finishReason,
       }),
@@ -165,10 +261,10 @@ export const recordAgentStep = (
 
   const summary =
     toolCalls.length > 0
-      ? `Used ${toolCalls.map((item) => item.name).join(', ')}`
+      ? `已使用工具：${toolCalls.map((item) => getToolDisplayName(item.name)).join('、')}`
       : step.text
-        ? 'Generated a reasoning step.'
-        : `Finished with ${step.finishReason}.`;
+        ? '已生成一次推理步骤。'
+        : `本轮已结束，原因：${step.finishReason}。`;
 
   return {
     stepNumber: step.stepNumber,

@@ -4,7 +4,7 @@ export const summarizeToolPayload = (value: unknown): string => {
   const raw = JSON.stringify(value);
 
   if (!raw) {
-    return 'empty';
+    return '空结果';
   }
 
   return raw.length <= 180 ? raw : `${raw.slice(0, 177)}...`;
