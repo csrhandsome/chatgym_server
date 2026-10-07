@@ -8,15 +8,22 @@ Both LLM and embedding implementations accept `config.baseURL`. OSS adds with `{
 
 ## Configuration and startup
 
+Mem0 OSS runs inside the Bun backend and connects over HTTP to a native Qdrant v1.18.0 process. For Linux x86_64, install the [official release](https://github.com/qdrant/qdrant/releases/tag/v1.18.0) inside this project:
+
 ```bash
 bun install --frozen-lockfile
-docker compose -f compose.mem0.yml up -d
+mkdir -p .data/qdrant/bin
+curl -fL --retry 2 https://github.com/qdrant/qdrant/releases/download/v1.18.0/qdrant-x86_64-unknown-linux-gnu.tar.gz -o /tmp/chatgym-qdrant-v1.18.0.tar.gz
+tar -xzf /tmp/chatgym-qdrant-v1.18.0.tar.gz -C .data/qdrant/bin
 ```
 
-Merge `config/mem0.env.example` into the existing local `.env`, preserving all existing values. Keep keys only in local environment. Set:
+The official [installation guide](https://qdrant.tech/documentation/installation/#from-source) also documents compilation from source for other environments. `QDRANT_BINARY` may override the executable path.
+
+Merge `config/mem0.env.example` into the existing local `.env`, preserving provider settings and credentials. Configure:
 
 ```dotenv
-MEM0_QDRANT_URL=http://127.0.0.1:16333
+MEM0_QDRANT_URL=http://127.0.0.1:26333
+MEM0_QDRANT_PORT=26333
 MEM0_LLM_MODEL=YOUR_SUPPORTED_CHAT_MODEL
 MEM0_EMBEDDING_MODEL=YOUR_SUPPORTED_EMBEDDING_MODEL
 MEM0_EMBEDDING_DIMS=YOUR_VERIFIED_VECTOR_LENGTH
@@ -24,24 +31,34 @@ MEM0_EMBEDDING_DIMS=YOUR_VERIFIED_VECTOR_LENGTH
 
 `MEM0_LLM_API_KEY` falls back to `AI_PROVIDER_API_KEY`, `AI_GATEWAY_API_KEY`, then `OPENAI_API_KEY`. `MEM0_LLM_BASE_URL` falls back to `AI_PROVIDER_BASE_URL`, then `https://api.openai.com/v1`. Override `MEM0_EMBEDDING_API_KEY` and `MEM0_EMBEDDING_BASE_URL` for a separate embedding service; otherwise they reuse the extraction key/endpoint. Embedding model/dimension must be explicit. A chat model is required for extraction.
 
+Verify the embedding endpoint and set dimensions to its measured vector length:
+
 ```bash
 bun run mem0:verify-provider
+```
+
+The verification prints only model ID and numeric vector length. The example `BAAI/bge-m3` is a candidate; use a model supported by your provider. The current local `text-embedding-v4` endpoint was verified to return valid 1024-dimensional vectors.
+
+In separate terminals, start the database and backend:
+
+```bash
+bun run qdrant:start
 bun run start
 ```
 
-The verification sends one embedding request and prints only model ID and numeric vector length. Set dimensions to that measured length. The example `BAAI/bge-m3`/1024 is a candidate, **not a verified working model for this account**. The existing compatible provider returned HTTP 402 for that candidate during implementation. Resolve provider access/billing or select an accessible embedding model, then rerun. No real provider/embedding success is claimed.
+`config/qdrant.local.yaml` binds to localhost on port 26333, disables telemetry, and persists data in `.data/qdrant/storage` with snapshots in `.data/qdrant/snapshots`. The starter forwards `MEM0_QDRANT_PORT` and a non-empty `MEM0_QDRANT_API_KEY`. Keep the database process running while using memory features; Ctrl+C stops it while retaining its data. The release executable alone does not include the web dashboard's static assets; the HTTP API remains available.
 
-Configuration is resolved lazily. Missing config produces an actionable 503 only on memory access. Login, `/api/auth/me` and `/api/health` remain independent of Mem0/LLM/vectorstore startup. Preserve persistent `AUTH_DB_PATH` (default `.data/users.sqlite`) and JWT secret across restarts. User identity SQLite stores accounts/password hashes only.
+`MEM0_COLLECTION` defaults to `chatgym_memories_v1`. Changing embedding model/dimensions requires a new collection and re-embedding existing memories. Keep persistent `AUTH_DB_PATH` (default `.data/users.sqlite`) and JWT secret across restarts. User identity SQLite stores accounts/password hashes only. For deployment, keep Qdrant on a private network and expose the authenticated backend.
 
-The named volume `chatgym-mem0_qdrant_data` persists Qdrant memories; never remove it during updates. `MEM0_COLLECTION` defaults to `chatgym_memories_v1`. Changing embedding model/dimensions requires a new collection and re-embedding migration.
+Configuration is resolved lazily. Missing config produces an actionable 503 only on memory access. Login, `/api/auth/me` and `/api/health` remain independent of Mem0/LLM/vectorstore startup.
 
-Local compose binds Qdrant to localhost only, without authentication by default. Set the same non-empty `MEM0_QDRANT_API_KEY` for backend and compose, then enable the auth override:
+To verify real providers against the running database:
 
 ```bash
-docker compose --env-file .env -f compose.mem0.yml -f compose.mem0.auth.yml up -d
+bun run mem0:verify-memory
 ```
 
-An empty Qdrant API key still enables authentication, so the base compose omits it and the override requires a non-empty value. For deployment, retain durable account data and keep Qdrant on a private network, exposing only the authenticated backend.
+This makes model requests, writes synthetic facts into random test collections, and deletes those collections afterward. Real-provider verification passed write/read, semantic retrieval, update, LLM fact extraction and deletion with Bun 1.4.2, Mem0 3.3.1 and native Qdrant 1.18.0.
 
 ## Contracts, isolation and traceability
 
@@ -89,7 +106,7 @@ bun run mem0:migrate --rollback .data/mem0-migration/manifest-mapped.json
 
 Replace `--user-map` with `--preserve-user-ids` only when deliberately preserving historical ownership. All rows/mappings are validated before remote writes. The manifest binds to source snapshot, mapping and collection; changing a mapping after dry run needs a new backup/manifest. Crash recovery reconciles fingerprints and migration IDs, including writes completed before checkpoint. Rollback excludes preexisting memories and refuses deletion if a user edited an imported memory. Backup/manifest/map must be kept private and backed up. Only one process may use a manifest; inspect recovery state before manually removing a stale `.lock` after a hard process kill.
 
-Actual existing DB dry-run artifacts: `.data/mem0-migration/legacy-backup.sqlite` and `manifest.json`, **2 rows, 0 remote imports**. Original SQLite bytes remain unchanged. That dry-run manifest deliberately preserves historical IDs; real reassociation needs verified mapping and new paths. Real import awaits provider access and ownership mapping.
+Migration is optional and only needed when importing an existing SQLite memory store. A fresh setup can start with an empty Qdrant collection.
 
 ## Tests
 
@@ -97,10 +114,12 @@ Actual existing DB dry-run artifacts: `.data/mem0-migration/legacy-backup.sqlite
 bun run typecheck
 bun test
 bun run test:mem0
-# Uses real OSS SDK + local persistent Qdrant, mocked model HTTP, no real secrets:
+# Starts its own native Qdrant on an ephemeral port with temporary storage.
+# Uses the real OSS SDK and local model fixtures; no provider credentials needed.
+# Restarts the database process and checks persisted data before cleaning up.
 bun run test:mem0:integration
-# Optional: also restart THIS compose's Qdrant and verify the same data afterward.
-MEM0_TEST_RESTART_QDRANT=1 bun run test:mem0:integration
 ```
 
-Regular fixtures inject `tests/helpers/fake-mem0-adapter.ts`; production never imports it. Facade tests cover scopes/events/readback/errors. Real integration uses separate local LLM/embedding endpoints and verifies semantic synonyms, extraction, isolation, CRUD, restart persistence and durable deduplication. The optional restart flag restarts only this task compose's Qdrant at localhost:16333; memories, original inputs and userEdits were verified after the actual container restart (20 assertions passed). Cleanup targets only randomly named `chatgym_test_*` collections. Migration tests cover snapshots, mappings, checksums, dry run, repeated imports, interrupted writes and rollback protections. Existing API/JWT/planning/image contracts execute without real provider secrets.
+`bun run test:mem0:native` is an alias for the same integration test. `MEM0_TEST_QDRANT_BINARY` (or `QDRANT_BINARY`) may select a different executable; the default is `.data/qdrant/bin/qdrant`.
+
+Regular fixtures inject `tests/helpers/fake-mem0-adapter.ts`; production never imports it. Facade tests cover scopes/events/readback/errors. Native integration verifies semantic synonyms, extraction, isolation, CRUD, actual process restart persistence and durable deduplication (20 assertions). It stops its own database before removing temporary storage. Migration tests cover snapshots, mappings, checksums, dry run, repeated imports, interrupted writes and rollback protections. Existing API/JWT/planning/image contracts execute without real provider secrets.

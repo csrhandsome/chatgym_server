@@ -74,7 +74,7 @@ export const resolveMem0Config = (env: Record<string, string | undefined> = proc
     !env.MEM0_EMBEDDING_MODEL && 'MEM0_EMBEDDING_MODEL',
     !env.MEM0_QDRANT_URL && 'MEM0_QDRANT_URL',
   ].filter(Boolean);
-  if (missing.length) throw new MemoryUnavailableError(`Mem0 OSS configuration missing: ${missing.join(', ')}. Copy config/mem0.env.example into your local environment and start Qdrant with docker compose -f compose.mem0.yml up -d.`);
+  if (missing.length) throw new MemoryUnavailableError(`Mem0 OSS configuration missing: ${missing.join(', ')}. Copy config/mem0.env.example into your local environment and start Qdrant with bun run qdrant:start. See docs/mem0.md.`);
   const llmUrl = endpoint(env.MEM0_LLM_BASE_URL || env.AI_PROVIDER_BASE_URL || 'https://api.openai.com/v1', 'MEM0_LLM_BASE_URL');
   const embeddingUrl = endpoint(env.MEM0_EMBEDDING_BASE_URL || llmUrl, 'MEM0_EMBEDDING_BASE_URL');
   const dimension = positiveInt(env.MEM0_EMBEDDING_DIMS, 'MEM0_EMBEDDING_DIMS');

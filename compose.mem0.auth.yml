@@ -1,4 +1,0 @@
-services:
-  qdrant:
-    environment:
-      QDRANT__SERVICE__API_KEY: ${MEM0_QDRANT_API_KEY:?Set MEM0_QDRANT_API_KEY in your local environment}

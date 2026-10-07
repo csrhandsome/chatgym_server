@@ -14,10 +14,13 @@
     "test:perf": "RUN_PERFORMANCE_TESTS=1 bun test src/agent/shared/tests/performance.test.ts",
     "dev": "bun run --watch index.ts",
     "start": "bun run index.ts",
+    "qdrant:start": "bun run scripts/start-qdrant-local.ts",
+    "test:mem0:native": "bun run test:mem0:integration",
     "typecheck": "bunx tsc --noEmit",
     "test:mem0": "bun test tests/mem0-adapter.test.ts tests/mem0-migration.test.ts src/agent/shared/tests/workout-memory.test.ts",
     "test:mem0:integration": "RUN_MEM0_INTEGRATION=1 bun test tests/mem0-qdrant.integration.test.ts",
     "mem0:verify-provider": "bun scripts/verify-mem0-provider.ts",
+    "mem0:verify-memory": "bun scripts/verify-mem0-memory.ts",
     "mem0:migrate": "bun scripts/migrate-workout-memory.ts"
   },
   "devDependencies": {

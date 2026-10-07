@@ -36,3 +36,4 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Durable user accounts, Mem0 provenance, migration backups (never commit personal data)
 .data/
 .mem0/
+.qdrant-initialized

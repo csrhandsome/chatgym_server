@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Mem0OssAdapter, MemoryNotFoundError, resolveMem0Config } from '../src/agent/shared/mem0-adapter';
 import { WorkoutMemoryStore } from '../src/agent/shared/workout-memory-store';
 
@@ -10,7 +10,41 @@ const integration = process.env.RUN_MEM0_INTEGRATION === '1' ? test : test.skip;
 integration('real Mem0 OSS + persistent Qdrant: isolation, semantic retrieval, chat extraction, update/delete and restart', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'chatgym-mem0-sdk-'));
   const collection = `chatgym_test_${crypto.randomUUID().replaceAll('-', '')}`;
-  const qdrantUrl = process.env.MEM0_TEST_QDRANT_URL || 'http://127.0.0.1:16333';
+  const nativeBinary = process.env.MEM0_TEST_QDRANT_BINARY || process.env.QDRANT_BINARY || '.data/qdrant/bin/qdrant';
+  // Native mode owns a separate process, random port and disposable storage.
+  const portProbe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() });
+  const nativePort = portProbe.port;
+  portProbe.stop(true);
+  const qdrantUrl = `http://127.0.0.1:${nativePort}`;
+  let qdrant: ReturnType<typeof Bun.spawn> | undefined;
+  const waitReady = async () => {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      if (qdrant && qdrant.exitCode !== null) throw new Error(`Native Qdrant exited with code ${qdrant.exitCode}.`);
+      try { if ((await fetch(`${qdrantUrl}/readyz`, { signal: AbortSignal.timeout(1000) })).ok) return; } catch {}
+      await Bun.sleep(100);
+    }
+    throw new Error('Qdrant did not become ready.');
+  };
+  const startNative = async () => {
+    qdrant = Bun.spawn([resolve(nativeBinary), '--config-path', new URL('../config/qdrant.local.yaml', import.meta.url).pathname], {
+      cwd: directory,
+      env: {
+        QDRANT__SERVICE__HTTP_PORT: String(nativePort),
+        QDRANT__STORAGE__STORAGE_PATH: join(directory, 'qdrant-storage'),
+        QDRANT__STORAGE__SNAPSHOTS_PATH: join(directory, 'qdrant-snapshots'),
+      },
+      stdout: 'ignore', stderr: 'inherit',
+    });
+    await waitReady();
+  };
+  const stopNative = async () => {
+    if (!qdrant) return;
+    qdrant.kill('SIGTERM');
+    const timer = setTimeout(() => qdrant?.kill('SIGKILL'), 5000);
+    try { await qdrant.exited; } finally { clearTimeout(timer); }
+    qdrant = undefined;
+  };
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
@@ -38,6 +72,7 @@ integration('real Mem0 OSS + persistent Qdrant: isolation, semantic retrieval, c
     MEM0_EMBEDDING_API_KEY: 'local-mock-key', MEM0_EMBEDDING_BASE_URL: `${server.url}embedding/v1`, MEM0_EMBEDDING_MODEL: 'mock-embedding',
     MEM0_EMBEDDING_DIMS: '3', MEM0_QDRANT_URL: qdrantUrl, MEM0_COLLECTION: collection, MEM0_DATA_DIR: directory });
   try {
+    await startNative();
     const store = new WorkoutMemoryStore(new Mem0OssAdapter(config));
     const base = { completedAt: '2026-10-01T10:00:00.000Z', sessionType: 'strength' as const, durationMinutes: 60,
       muscleGroups: ['胸'], intensity: 'medium' as const };
@@ -56,20 +91,9 @@ integration('real Mem0 OSS + persistent Qdrant: isolation, semantic retrieval, c
     expect(await store.searchMemories('bob', 'morning')).toEqual([]);
     expect((await store.searchMemories('alice', 'pectoral'))[0]!.id).toBe(facts[0]!.id);
     await store.updateMemory('alice', facts[0]!.id, 'User prefers evening pectoral workouts.');
-    if (process.env.MEM0_TEST_RESTART_QDRANT === '1') {
-      if (qdrantUrl !== 'http://127.0.0.1:16333') throw new Error('Restart verification is restricted to this task compose on localhost:16333.');
-      const child = Bun.spawn(['docker', 'compose', '-f', new URL('../compose.mem0.yml', import.meta.url).pathname, 'restart', 'qdrant'], { stdout: 'pipe', stderr: 'pipe' });
-      const [exitCode] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      if (exitCode !== 0) throw new Error('Task-owned Qdrant restart failed.');
-      const deadline = Date.now() + 30_000;
-      let ready = false;
-      while (Date.now() < deadline) {
-        try { ready = (await fetch(`${qdrantUrl}/readyz`)).ok; } catch {}
-        if (ready) break;
-        await Bun.sleep(100);
-      }
-      if (!ready) throw new Error('Task-owned Qdrant did not become ready after restart.');
-    }
+    await stopNative();
+    await startNative();
+    console.log('Native Qdrant process restarted; verifying persisted Mem0 data.');
     const restarted = new WorkoutMemoryStore(new Mem0OssAdapter(config));
     expect(await restarted.getUserSessionCount('alice')).toBe(2);
     const restoredFact = (await restarted.searchMemories('alice', 'pectoral'))[0]!;
@@ -88,8 +112,10 @@ integration('real Mem0 OSS + persistent Qdrant: isolation, semantic retrieval, c
   } finally {
     server.stop(true);
     if (oldDataDir === undefined) delete process.env.MEM0_DATA_DIR; else process.env.MEM0_DATA_DIR = oldDataDir;
-    // Cleanup is strictly limited to randomly named collections created by THIS test.
-    for (const name of [collection, `${collection}_entities`]) await fetch(`${qdrantUrl}/collections/${name}`, { method: 'DELETE' });
-    rmSync(directory, { recursive: true, force: true });
+    try {
+      await stopNative();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   }
 }, 60_000);

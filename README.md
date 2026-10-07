@@ -11,6 +11,12 @@ bun install
 
 To run in development:
 
+Memory features require the local Qdrant service. Follow [Mem0 setup](docs/mem0.md) to install its executable and configure `.env`, then keep it running in another terminal:
+
+```bash
+bun run qdrant:start
+```
+
 ```bash
 bun run dev
 ```

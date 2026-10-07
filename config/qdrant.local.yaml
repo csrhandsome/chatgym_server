@@ -1,0 +1,13 @@
+# Run from the repository root. Data survives process restarts.
+log_level: INFO
+telemetry_disabled: true
+storage:
+  storage_path: .data/qdrant/storage
+  snapshots_path: .data/qdrant/snapshots
+service:
+  host: 127.0.0.1
+  http_port: 26333
+  grpc_port: null
+  max_workers: 2
+cluster:
+  enabled: false
