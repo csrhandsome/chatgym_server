@@ -24,14 +24,18 @@ import { planApiResponseSchema, planningDialogResponseSchema, trainingPlanSchema
 import { analyzeFitnessImages } from '../../vlm/workflows/analyze-fitness-images';
 import { buildPlanningMessages, planningOutputContract } from '../prompts/user-message';
 import { buildPlanningSystemPrompt } from '../prompts/system';
+import { resolveCoachPersona } from '../personas';
 import { reviewTrainingPlan } from '../review/review-training-plan';
 import { buildProgrammingConstraints, createPlanningTools } from '../tools/create-planning-tools';
 import { resolvePlanningInteractionMode, type PlanningInteractionMode } from '../interaction-mode';
 import { SUPPORTED_EXERCISE_GUIDANCE } from '../../shared/training-taxonomy';
 import {
-  resolveMuscleGroup,
-  resolveSupportedExerciseName,
-} from '../../shared/training-taxonomy';
+  clampInteger,
+  intensityMap,
+  planHorizonMap,
+  sanitizeMainBlocks,
+  toStringList,
+} from './plan-sanitize';
 
 const buildRetrievalQuery = (request: PlanRequestInput) =>
   [
@@ -83,86 +87,6 @@ const formatFoodCalorieContext = (results: VlmImageInsight[]) => {
   return sections.length > 0 ? sections.join('\n\n') : null;
 };
 
-const planHorizonMap: Record<string, TrainingPlan['planHorizon']> = {
-  '1_week': '1_week',
-  '1周': '1_week',
-  '一周': '1_week',
-  '2_weeks': '2_weeks',
-  '2周': '2_weeks',
-  '两周': '2_weeks',
-  '4_weeks': '4_weeks',
-  '4周': '4_weeks',
-  '四周': '4_weeks',
-};
-
-const intensityMap: Record<string, 'low' | 'medium' | 'high'> = {
-  low: 'low',
-  medium: 'medium',
-  high: 'high',
-  低: 'low',
-  低强度: 'low',
-  中: 'medium',
-  中等: 'medium',
-  中等强度: 'medium',
-  高: 'high',
-  高强度: 'high',
-};
-
-const integerStringPattern = /^[+-]?\d+$/;
-
-const clampInteger = (value: unknown, min: number, max: number, fallback: number) => {
-  const numeric =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string' && integerStringPattern.test(value.trim())
-        ? Number.parseInt(value.trim(), 10)
-        : Number.NaN;
-
-  if (!Number.isFinite(numeric)) {
-    return fallback;
-  }
-
-  return Math.min(max, Math.max(min, Math.round(numeric)));
-};
-
-const toStringList = (value: unknown): string[] => {
-  if (Array.isArray(value)) {
-    return value
-      .flatMap((item) => toStringList(item))
-      .map((item) => item.trim())
-      .filter(Boolean);
-  }
-
-  if (typeof value === 'string') {
-    return value.trim() ? [value.trim()] : [];
-  }
-
-  if (value && typeof value === 'object') {
-    return Object.values(value)
-      .flatMap((item) => toStringList(item))
-      .map((item) => item.trim())
-      .filter(Boolean);
-  }
-
-  return [];
-};
-
-const toSupportedExerciseList = (value: unknown, limit: number) => {
-  const resolved = toStringList(value)
-    .map((item) => resolveSupportedExerciseName(item))
-    .filter((item): item is NonNullable<typeof item> => item !== null);
-
-  return [...new Set(resolved)].slice(0, limit);
-};
-
-const toSupportedMuscleList = (value: unknown, limit: number) => {
-  const resolved = toStringList(value)
-    .map((item) => resolveMuscleGroup(item))
-    .filter((item): item is NonNullable<typeof item> => item !== null);
-
-  return [...new Set(resolved)].slice(0, limit);
-};
-
 const sanitizeTrainingPlanCandidate = (value: unknown): unknown => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return value;
@@ -212,42 +136,7 @@ const sanitizeTrainingPlanCandidate = (value: unknown): unknown => {
                 : sessionCandidate.intensity,
             durationMinutes: clampInteger(sessionCandidate.durationMinutes, 15, 180, 45),
             warmup: toStringList(sessionCandidate.warmup).slice(0, 6),
-            mainBlocks: Array.isArray(sessionCandidate.mainBlocks)
-              ? sessionCandidate.mainBlocks.map((block) => {
-                  if (!block || typeof block !== 'object' || Array.isArray(block)) {
-                    return block;
-                  }
-
-                  const blockCandidate = block as Record<string, unknown>;
-
-                  return {
-                    ...blockCandidate,
-                    exercises: Array.isArray(blockCandidate.exercises)
-                      ? blockCandidate.exercises.map((exercise) => {
-                          if (!exercise || typeof exercise !== 'object' || Array.isArray(exercise)) {
-                            return exercise;
-                          }
-
-                          const exerciseCandidate = exercise as Record<string, unknown>;
-
-                          return {
-                            ...exerciseCandidate,
-                            name:
-                              typeof exerciseCandidate.name === 'string'
-                                ? (resolveSupportedExerciseName(exerciseCandidate.name) ??
-                                  exerciseCandidate.name)
-                                : exerciseCandidate.name,
-                            sets: clampInteger(exerciseCandidate.sets, 1, 8, 3),
-                            reps: clampInteger(exerciseCandidate.reps, 1, 100, 10),
-                            restSeconds: clampInteger(exerciseCandidate.restSeconds, 15, 600, 60),
-                            primaryMuscles: toSupportedMuscleList(exerciseCandidate.primaryMuscles, 4),
-                            alternatives: toSupportedExerciseList(exerciseCandidate.alternatives, 3),
-                          };
-                        })
-                      : [],
-                  };
-                })
-              : [],
+            mainBlocks: sanitizeMainBlocks(sessionCandidate.mainBlocks),
             cooldown: toStringList(sessionCandidate.cooldown).slice(0, 6),
             notes: toStringList(sessionCandidate.notes).slice(0, 8),
             recoveryWindowHours: clampInteger(sessionCandidate.recoveryWindowHours, 12, 96, 48),
@@ -464,6 +353,19 @@ export const generatePlanningResponse = async ({
   });
 
   const interactionMode = requestedInteractionMode ?? resolvePlanningInteractionMode(request);
+  const persona = resolveCoachPersona(request.coachId ?? request.goal.requestNote);
+
+  trace.push(
+    timestampedTrace('coach-persona', 'completed', `已选择教练人设：${persona.name}。`, {
+      personaId: persona.id,
+    }),
+  );
+
+  recordWorkflowThinking(emit, {
+    stage: 'coach-persona',
+    summary: `已选择教练人设：${persona.name}。`,
+    output: { personaId: persona.id },
+  });
 
   trace.push(
     timestampedTrace(
@@ -622,6 +524,7 @@ export const generatePlanningResponse = async ({
     model: resolvePlanningModel(),
     instructions: buildPlanningSystemPrompt({
       interactionMode,
+      persona,
     }),
     tools: createPlanningTools(runtime.workoutMemoryStore, {
       onToolCall: ({ toolName, toolCallId, input }) => {

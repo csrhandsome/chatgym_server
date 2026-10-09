@@ -45,6 +45,9 @@ export const createApp = (runtime: ServerRuntime = createRuntime()) =>
           imageAnalysisStream: '/api/agent/vlm/analyze/stream',
           trainingPlanner: '/api/agent/plan',
           trainingPlannerStream: '/api/agent/plan/stream',
+          coachPersonas: '/api/agent/coaches',
+          dailyPlanner: '/api/agent/daily',
+          dailyPlannerStream: '/api/agent/daily/stream',
           workoutMemory: '/api/agent/memory/session',
         },
         ws: {

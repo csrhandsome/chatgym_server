@@ -161,4 +161,5 @@ export const SUPPORTED_EXERCISE_GUIDANCE = [
   'Use only these exact frontend-supported exercise names in plans and tool outputs.',
   `力量训练：${SUPPORTED_EXERCISE_GROUPS.strength.join('、')}`,
   `有氧训练：${SUPPORTED_EXERCISE_GROUPS.cardio.join('、')}`,
+  '覆盖范围：胸=卧推/蝴蝶飞鸟/龙门架夹胸；背=引体向上/高位下拉/哑铃划船/坐姿划船/T杆划船；腿臀=杠铃深蹲/臀桥；手臂目前只有哑铃弯举（肱二头肌），不要把它当成三头动作，也不要把训练区块命名为「三头」；有氧=跑步机/爬楼机，按分钟计（sets=1，reps=分钟数）。',
 ].join('\n');

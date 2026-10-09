@@ -55,8 +55,37 @@ bun run test:perf
 - `POST /api/agent/vlm/analyze/stream` authenticated SSE stream for image analysis
 - `POST /api/agent/plan` authenticated training plan generation
 - `POST /api/agent/plan/stream` authenticated SSE stream for plan generation
+- `GET /api/agent/coaches` list selectable coach personas (skills)
+- `POST /api/agent/daily` authenticated single-day plan generated through chat
+- `POST /api/agent/daily/stream` authenticated SSE stream for single-day plan generation
 - `POST /api/agent/memory/session` authenticated memory ingestion
 - `GET /api/agent/memory/me` authenticated workout memory list
+
+## Coach personas
+
+Training plans are shaped by a selectable coach persona ("skill"). Pass `coachId` in any plan
+request (`/api/agent/plan`, `/api/agent/daily`); it accepts an id, a display name, an alias, or a
+free-text mention inside `goal.requestNote`. Omitting it uses the generic evidence-based persona.
+
+| id | 人物 | 风格 |
+| --- | --- | --- |
+| `tan-chengyi` | 谭成义 | 三分化，训练质量优先于重量，动作细节讲透 |
+| `kai-shengwang` | 凯圣王 | 快速三分化循环，频率优先，新手友好 |
+| `zhang-laoshi` | 心平气和的张老师 | 科普向，渐进超负荷与恢复，警惕过度训练 |
+| `luo-xueyang` | 罗雪阳 | 女性力量/形体，技术优先，力量与减脂并行 |
+| `carina-sitong` | Carina思潼 | 女性撸铁日常，中等重量，配合低脂低糖饮食 |
+| `science-muscle` | 通用科学增肌 | 默认。平衡、可持续的基础训练规划 |
+
+Personas live in `src/agent/planning/personas/`; each file defines philosophy, split structure,
+volume/intensity guidance, preferred exercises (constrained to the 13 supported names), voice and
+signature cues. Daily plans come from `POST /api/agent/daily`, which returns a single structured
+session (`warmup` / `mainBlocks` / `cooldown` plus `coachTips` and `adaptations`) rather than a week.
+
+Real-model check that ordinary chat prompts produce coach-shaped plans:
+
+```bash
+bun run test:api:real:daily
+```
 
 ## Auth
 

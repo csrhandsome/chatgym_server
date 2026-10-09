@@ -1,5 +1,7 @@
 import { Elysia, t } from 'elysia';
+import { generateDailyPlanResponse } from '../agent/planning/workflows/generate-daily-plan';
 import { generatePlanningResponse } from '../agent/planning/workflows/generate-training-plan';
+import { listCoachPersonas } from '../agent/planning/personas';
 import {
   memoryAppendRequestSchema,
   type PlanImageInput,
@@ -507,6 +509,151 @@ export const createAgentApi = (runtime: ServerRuntime) =>
       {
         detail: {
           summary: 'Stream training plan generation progress as SSE events',
+          tags: ['agent', 'stream'],
+        },
+        parse: 'none',
+        response: {
+          200: t.Any(),
+          401: errorResponseSchema,
+          422: errorResponseSchema,
+        },
+      },
+    )
+    .get(
+      '/coaches',
+      () => ({ items: listCoachPersonas() }),
+      {
+        detail: {
+          summary: 'List selectable coach personas (skills) for plan generation',
+          tags: ['agent', 'coaches'],
+        },
+        response: { 200: t.Any() },
+      },
+    )
+    .post(
+      '/daily',
+      async ({ headers, jwt, request, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+
+        if (!currentUser) {
+          set.status = 401;
+
+          return {
+            message: 'authorization token required',
+          };
+        }
+
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartPlanRequest(request, currentUser.id, currentUser.username));
+
+        if (rawPayload === invalidJsonPayload) {
+          set.status = 422;
+
+          return {
+            message: 'invalid JSON payload',
+          };
+        }
+
+        const parsed = planRequestSchema.safeParse(rawPayload);
+
+        if (!parsed.success) {
+          set.status = 422;
+
+          return {
+            message: 'invalid daily plan request payload',
+            issues: parsed.error.flatten(),
+          };
+        }
+
+        try {
+          return await generateDailyPlanResponse({
+            runtime,
+            request: normalizePlanRequest(parsed.data, currentUser),
+          });
+        } catch (error) {
+          if (error instanceof MemoryUnavailableError || error instanceof MemoryNotFoundError) {
+            throw error;
+          }
+          set.status = 500;
+
+          return {
+            message: error instanceof Error ? error.message : 'failed to generate daily plan',
+          };
+        }
+      },
+      {
+        detail: {
+          summary:
+            'Generate a single-day training plan through chat, shaped by the selected coach persona',
+          tags: ['agent'],
+        },
+        parse: 'none',
+        response: {
+          200: t.Any(),
+          401: errorResponseSchema,
+          422: errorResponseSchema,
+          500: errorResponseSchema,
+          503: errorResponseSchema,
+        },
+      },
+    )
+    .post(
+      '/daily/stream',
+      async ({ headers, jwt, request, set }) => {
+        const currentUser = await resolveAuthenticatedUser(runtime, headers.authorization, jwt);
+
+        if (!currentUser) {
+          set.status = 401;
+
+          return {
+            message: 'authorization token required',
+          };
+        }
+
+        const rawPayload = await parseAgentRequest(request, () =>
+          parseMultipartPlanRequest(request, currentUser.id, currentUser.username));
+
+        if (rawPayload === invalidJsonPayload) {
+          set.status = 422;
+
+          return {
+            message: 'invalid JSON payload',
+          };
+        }
+
+        const parsed = planRequestSchema.safeParse(rawPayload);
+
+        if (!parsed.success) {
+          set.status = 422;
+
+          return {
+            message: 'invalid daily plan request payload',
+            issues: parsed.error.flatten(),
+          };
+        }
+
+        const requestId = crypto.randomUUID();
+
+        return createAgentSseResponse({
+          onStart: async (emit) => {
+            await generateDailyPlanResponse({
+              runtime,
+              requestId,
+              onEvent: emit,
+              request: normalizePlanRequest(parsed.data, currentUser),
+            });
+          },
+          onError: (error) =>
+            createErrorEvent({
+              requestId,
+              stage: 'daily-plan',
+              error,
+            }),
+        });
+      },
+      {
+        detail: {
+          summary: 'Stream single-day training plan generation progress as SSE events',
           tags: ['agent', 'stream'],
         },
         parse: 'none',

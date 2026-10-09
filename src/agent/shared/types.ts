@@ -113,6 +113,9 @@ export const planRequestSchema = z.object({
   mode: z.string().min(1).max(40).optional(),
   toolStrategy: z.string().min(1).max(40).optional(),
   conversationMode: z.boolean().optional(),
+  // Selects a coach persona ("skill"). Accepts an id, a display name, an alias,
+  // or a free-text mention such as "按谭成义的三分化练".
+  coachId: z.string().min(1).max(80).optional(),
 });
 
 export const exerciseRecommendationSchema = z.object({
@@ -298,6 +301,40 @@ export const planningDialogResponseSchema = planApiResponseSchema
   .omit({ plan: true, review: true })
   .extend({ mode: z.literal('dialog'), answer: z.string().min(1) });
 
+/**
+ * A single coaching day, produced through chat. Reuses the weekly session
+ * building blocks (warmup / mainBlocks / cooldown) so the frontend can render it
+ * with the same components, without the weekly-only fields.
+ */
+export const dailyPlanSchema = z.object({
+  date: z.string().min(1).max(40),
+  dayLabel: z.string().min(1).max(80),
+  title: z.string().min(1).max(120),
+  focus: z.string().min(1).max(120),
+  goal: z.string().min(1).max(240),
+  intensity: sessionIntensitySchema,
+  durationMinutes: z.number().int().min(15).max(180),
+  warmup: z.array(z.string().min(1).max(160)).min(1).max(6),
+  mainBlocks: z.array(trainingBlockSchema).min(1).max(3),
+  cooldown: z.array(z.string().min(1).max(160)).min(1).max(6),
+  notes: z.array(z.string().min(1).max(200)).min(1).max(8),
+  coachTips: z.array(z.string().min(1).max(240)).min(1).max(8),
+  adaptations: z.array(z.string().min(1).max(240)).max(8).default([]),
+  recoveryWindowHours: z.number().int().min(12).max(96),
+});
+
+export const planDailyResponseSchema = planApiResponseSchema
+  .omit({ plan: true })
+  .extend({
+    mode: z.literal('daily'),
+    persona: z.object({
+      id: z.string().min(1).max(80),
+      name: z.string().min(1).max(80),
+      tagline: z.string().min(1).max(200),
+    }),
+    dailyPlan: dailyPlanSchema,
+  });
+
 export const vlmTaskSchema = z.enum([
   'food_calorie_estimate',
   'equipment_question',
@@ -393,6 +430,8 @@ export type PlanReview = z.infer<typeof planReviewSchema>;
 export type MemoryAppendRequest = z.infer<typeof memoryAppendRequestSchema>;
 export type PlanApiResponse = z.infer<typeof planApiResponseSchema>;
 export type PlanningDialogResponse = z.infer<typeof planningDialogResponseSchema>;
+export type DailyPlan = z.infer<typeof dailyPlanSchema>;
+export type PlanDailyResponse = z.infer<typeof planDailyResponseSchema>;
 export type VlmTask = z.infer<typeof vlmTaskSchema>;
 export type VlmAnalyzeRequest = z.infer<typeof vlmAnalyzeRequestSchema>;
 export type VlmAnalyzeResponse = z.infer<typeof vlmAnalyzeResponseSchema>;

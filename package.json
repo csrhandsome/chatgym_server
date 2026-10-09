@@ -11,6 +11,7 @@
     "test": "bun test",
     "test:api": "bun test tests/api",
     "test:api:real": "RUN_REAL_MODEL_TEST=1 bun run tests/api/real-model-smoke.ts",
+    "test:api:real:daily": "RUN_REAL_MODEL_TEST=1 bun run tests/api/real-daily-smoke.ts",
     "test:perf": "RUN_PERFORMANCE_TESTS=1 bun test src/agent/shared/tests/performance.test.ts",
     "dev": "bun run --watch index.ts",
     "start": "bun run index.ts",
